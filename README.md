@@ -1,2 +1,2 @@
 # Vision-Transformer-from-Scratch
-This model is a vision transformer coded from scratch with numpy.
+This model is a Vision Transformer coded from scratch with numpy.
