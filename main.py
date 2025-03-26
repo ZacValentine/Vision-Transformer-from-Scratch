@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from mnistDataLoader import MnistDataloader
 from scipy.special import erf
 import pickle
+import json
 
 # gets data in usable form
 def unpickle(file):
@@ -10,13 +10,12 @@ def unpickle(file):
         dict = pickle.load(fo, encoding='bytes')
     return dict
 
-
 # get batch at index from dataset
 def get_batch(dict, index, batch_size):
     # shape: (batch_size) 
     labels = dict[b"coarse_labels"][index * batch_size: index * batch_size + batch_size]
     # shape: (batch_size, 32, 32, 3)
-    images = dict[b"data"][index * batch_size: index * batch_size + batch_size].reshape(batch_size, 3, 32, 32).transpose(0, 2, 3, 1)
+    images = dict[b"data"][index * batch_size: index * batch_size + batch_size].reshape(batch_size, 3, 32, 32).transpose(0, 2, 3, 1) #################r
 
     # convert to numpy array
     labels = np.array(labels)
@@ -57,12 +56,12 @@ def LAYERNORM_BACKWARD(dout, x, gamma, eps=1e-5):
 
     # from karpathy
     w = gamma
-    # recompute the norm (save memory at the cost of compute)
+   
     norm = (x - mean) * rstd
-    # gradients for weights, bias
-    db = dout.sum(axis = (0, 1)) # accross patches, for no batch. If using batch, I think it will be to sum accross both batch and patch dimension.
+
+    db = dout.sum(axis = (0, 1)) 
     dw = (dout * norm).sum(axis = (0, 1))
-    # gradients for input
+   
     dnorm = dout * w
     dx = dnorm - dnorm.mean(-1, keepdims=True) - norm * (dnorm * norm).mean(-1, keepdims=True)
     dx *= rstd
@@ -116,10 +115,14 @@ num_heads = 8
 num_layers = 6
 head_dim = embed_dim // num_heads
 num_classes = 20 # 20 for cifar, 10 for mnist
-learning_rate = 0.0005
-num_epochs = 1
+learning_rate = 0.0002
+num_epochs = 100
 num_examples = 50000 # 50,000 for cifar, 60,000 for mnist
-batch_size = 512
+batch_size = 64
+
+# # path to save weights and training stats
+checkpoint_weights_path = "saved/checkpoint_model_weights.pkl"
+checkpoint_stats_path = "saved/checkpoint_training_stats.json"
 
 # Base: layers: 12, embed_dim: 768, ff_dim: 3072, heads: 12, parameters: 86M
 # they did weird patch size upscaling thing, im just going to use size of 4
@@ -159,6 +162,14 @@ for _ in range(num_layers):
         "linear3": xavier_init(ff_dim, embed_dim),
         "bias3": np.zeros(embed_dim)
     })
+
+# for saving and viewing stats
+training_stats = {
+    "epochs": [],
+    "iterations": [],
+    "losses": [],
+    "accuracies": []
+}
 
 # pre-condition
 if rows % patch_size != 0 or cols % patch_size != 0:
@@ -291,9 +302,21 @@ for epoch in range(num_epochs):
         logits = bias5_out[:, 0]
 
         loss = cross_entropy(logits, targets)
-
-        print(f"loss {i}: {loss}")
         # end forward pass
+
+        # print while training
+        print(f"loss {i}: {loss}")
+        predictions = np.argmax(logits, axis=1)
+        targets_indices = np.argmax(targets, axis=1)
+        correct_predictions = np.sum(predictions == targets_indices)
+        accuracy = correct_predictions * 100 / batch_size
+        print("accuracy: " + str(accuracy) + "%")
+
+        # log stats
+        training_stats["epochs"].append(epoch)
+        training_stats["iterations"].append(i)
+        training_stats["losses"].append(loss)
+        training_stats["accuracies"].append(accuracy)
 
         # backpropagation
 
@@ -403,18 +426,18 @@ for epoch in range(num_epochs):
             dencoder_input = temp_dencoder_input + dresidual1
 
             # save gradients 
-            layer_grads[j]["dlinear_q"] = np.sum(dlinear_q, axis=0)
-            layer_grads[j]["dlinear_k"] = np.sum(dlinear_k, axis=0)
-            layer_grads[j]["dlinear_v"] = np.sum(dlinear_v, axis=0)
-            layer_grads[j]["dlinear_out"] = np.sum(dlinear_out, axis=0)
+            layer_grads[j]["dlinear_q"] = dlinear_q
+            layer_grads[j]["dlinear_k"] = dlinear_k
+            layer_grads[j]["dlinear_v"] = dlinear_v
+            layer_grads[j]["dlinear_out"] = dlinear_out
             layer_grads[j]["dgamma1"] = dgamma1
             layer_grads[j]["dbeta1"] = dbeta1
             layer_grads[j]["dgamma2"] = dgamma2
             layer_grads[j]["dbeta2"]  = dbeta2
-            layer_grads[j]["dlinear2"] = np.sum(dlinear2, axis=0)
-            layer_grads[j]["dbias2"] = np.sum(dbias2, axis=0)
-            layer_grads[j]["dlinear3"] = np.sum(dlinear3, axis=0)
-            layer_grads[j]["dbias3"] = np.sum(dbias3, axis=0)
+            layer_grads[j]["dlinear2"] = dlinear2
+            layer_grads[j]["dbias2"] = dbias2
+            layer_grads[j]["dlinear3"] = dlinear3
+            layer_grads[j]["dbias3"] = dbias3
 
         dposition_embeddings_out = dencoder_input
 
@@ -436,32 +459,46 @@ for epoch in range(num_epochs):
         # end backpropagation
 
         # optimization using SGD
-        linear1 -= np.mean(dlinear1, axis = 0) * learning_rate
+        linear1 -= np.sum(dlinear1, axis = 0) * learning_rate # was np.mean(), probably shouldn't have been
         bias1 -=  np.sum(dbias1, axis = 0) * learning_rate
         position_embeddings -= np.sum(dposition_embeddings, axis = 0) * learning_rate
         cls_token -= np.sum(dcls_token, axis = 0) * learning_rate
         for j in range(num_layers):
-            layers[j]["linear_q"] -= layer_grads[j]["dlinear_q"] * learning_rate
-            layers[j]["linear_k"] -= layer_grads[j]["dlinear_k"] * learning_rate
-            layers[j]["linear_v"] -= layer_grads[j]["dlinear_v"] * learning_rate
-            layers[j]["linear_out"] -= layer_grads[j]["dlinear_out"] * learning_rate
-            layers[j]["gamma1"] -= layer_grads[j]["dgamma1"] * learning_rate
-            layers[j]["beta1"] -= layer_grads[j]["dbeta1"] * learning_rate
-            layers[j]["gamma2"] -= layer_grads[j]["dgamma2"] * learning_rate
-            layers[j]["beta2"] -= layer_grads[j]["dbeta2"] * learning_rate
-            layers[j]["linear2"] -= layer_grads[j]["dlinear2"] * learning_rate
-            layers[j]["bias2"] -= layer_grads[j]["dbias2"] * learning_rate
-            layers[j]["linear3"] -= layer_grads[j]["dlinear3"] * learning_rate
-            layers[j]["bias3"] -= layer_grads[j]["dbias3"] * learning_rate
+            layers[j]["linear_q"] -=  np.sum(layer_grads[j]["dlinear_q"], axis = 0) * learning_rate
+            layers[j]["linear_k"] -=  np.sum(layer_grads[j]["dlinear_k"], axis = 0) * learning_rate
+            layers[j]["linear_v"] -=  np.sum(layer_grads[j]["dlinear_v"], axis = 0) * learning_rate
+            layers[j]["linear_out"] -=  np.sum(layer_grads[j]["dlinear_out"], axis = 0) * learning_rate
+            layers[j]["gamma1"] -= (layer_grads[j]["dgamma1"] / (batch_size * num_patches)) * learning_rate
+            layers[j]["beta1"] -= (layer_grads[j]["dbeta1"] / (batch_size * num_patches)) * learning_rate
+            layers[j]["gamma2"] -= (layer_grads[j]["dgamma2"] / (batch_size * num_patches)) * learning_rate
+            layers[j]["beta2"] -= (layer_grads[j]["dbeta2"] / (batch_size * num_patches)) * learning_rate
+            layers[j]["linear2"] -= np.sum(layer_grads[j]["dlinear2"], axis = 0) * learning_rate
+            layers[j]["bias2"] -= np.sum(layer_grads[j]["dbias2"], axis = 0) * learning_rate
+            layers[j]["linear3"] -= np.sum(layer_grads[j]["dlinear3"], axis = 0) * learning_rate
+            layers[j]["bias3"] -=  np.sum(layer_grads[j]["dbias3"], axis = 0) * learning_rate
         linear4 -= np.sum(dlinear4, axis = 0) * learning_rate
         bias4 -= np.sum(dbias4, axis = 0) * learning_rate
         linear5 -= np.sum(dlinear5, axis = 0) * learning_rate
         bias5 -= np.sum(dbias5, axis = 0) * learning_rate
 
-        # print while training
-        predictions = np.argmax(logits, axis=1)
-        targets_indices = np.argmax(targets, axis=1)
-        correct_predictions = np.sum(predictions == targets_indices)
-        print("accuracy:" + str(correct_predictions * 100 / batch_size) + "%")
-
         # after 1 epoch, the model achieves approximately 92% accuracy on mnist, showing the model works.
+    
+        # after every 100 iterations, save weights, store weights, and store stats
+        if i % 100 == 0:
+            model_weights = {
+                "linear1": linear1,
+                "bias1": bias1,
+                "position_embeddings": position_embeddings,
+                "cls_token": cls_token,
+                "linear4": linear4,
+                "bias4": bias4,
+                "linear5": linear5,
+                "bias5": bias5,
+                "layers": layers
+            }
+
+            with open(checkpoint_weights_path, "wb") as f:
+                pickle.dump(model_weights, f)
+            
+            with open(checkpoint_stats_path, "w") as f:
+                json.dump(training_stats, f)
