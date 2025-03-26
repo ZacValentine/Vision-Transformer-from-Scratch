@@ -16,7 +16,7 @@ def get_batch(dict, index, batch_size):
     # shape: (batch_size) 
     labels = dict[b"coarse_labels"][index * batch_size: index * batch_size + batch_size]
     # shape: (batch_size, 32, 32, 3)
-    images = dict[b"data"][index * batch_size: index * batch_size + batch_size].reshape(batch_size, 3, 32, 32).transpose(0, 2, 3, 1) #################r
+    images = dict[b"data"][index * batch_size: index * batch_size + batch_size].reshape(batch_size, 3, 32, 32).transpose(0, 2, 3, 1)
 
     # convert to numpy array
     labels = np.array(labels)
@@ -38,6 +38,7 @@ def get_patches(image_array, patch_size, color_dim, batch_size):
                         patches[image_i][patch_i][patch_j][i][j] = image_array[image_i][patch_i * patch_size + i][patch_j * patch_size + j]
     return patches
 
+# stable weight initialization
 def xavier_init(fan_in, fan_out):
     limit = np.sqrt(6 / (fan_in + fan_out))
     return np.random.uniform(-limit, limit, size=(fan_in, fan_out))
@@ -49,23 +50,21 @@ def layernorm(array, gamma, beta):
     norm = (array - mean) / (standard_deviation + 1e-5)
     return gamma * norm + beta
 
-def LAYERNORM_BACKWARD(dout, x, gamma, eps=1e-5):
+# calculates gradient of layernorm
+def layernorm_backward(dout, x, gamma, eps=1e-5):
     N = x.shape[-1]
     mean = np.mean(x, axis=-1, keepdims=True)
     std = np.sqrt(np.var(x, axis=-1, keepdims=True) + eps)
     rstd = std**-1
 
-    # from karpathy
     w = gamma
-   
     norm = (x - mean) * rstd
-
     db = dout.sum(axis = (0, 1)) 
     dw = (dout * norm).sum(axis = (0, 1))
-   
     dnorm = dout * w
     dx = dnorm - dnorm.mean(-1, keepdims=True) - norm * (dnorm * norm).mean(-1, keepdims=True)
     dx *= rstd
+
     return dx, dw, db
 
 # standard softmax function
@@ -73,19 +72,21 @@ def softmax(array):
     exp_array = np.exp(array - np.max(array, axis = -1, keepdims = True))
     return exp_array / np.sum(exp_array, axis = -1, keepdims = True)
 
+# standard gelu function
 def gelu(x):
     return x * (0.5 * (1 + erf(x / np.sqrt(2))))
 
+# calculates gradient of gelu
 def gelu_backward(x, dout):
-    # exact (derivation in notebook)
     return ( (0.5 * (1 + erf(x / np.sqrt(2)))) + ((x * np.exp(-(x**2 / 2))) / np.sqrt(2 * np.pi)) ) * dout
 
+# cross entropy loss function
 def cross_entropy(logits, targets):
-    # sums all exponentiated logits and applies log, subtracts the target index logit value from entire sum. Derivation of original softmax function to this form in notebook.
+    # sums all exponentiated logits and applies log, subtracts the target index logit value from entire sum.
     logits_copy = np.copy(logits)
     logits_copy -= np.max(logits_copy, axis = 1, keepdims = True)
 
-    # losses is loss per batch, is shape batch size, 1
+    # losses is loss per batch, shape: (batch size, 1)
     exp = np.exp(logits_copy)
     sum = np.sum(exp, axis = 1, keepdims = True)
     log = np.log(sum)
@@ -113,6 +114,7 @@ def visualize(label, image):
 # original Vi-T paper stats:
 # cifar 10 got 99.5 accuracy
 # cifar 100 got 94 accuracy
+# ^ my model is significantly smaller than this. See specifics below. 
 
 # parameters
 rows, cols = 32, 32 # (32, 32) for cifar, (28, 28) for mnist
@@ -207,7 +209,7 @@ else:
         "accuracies": []
     }
 
-# these are initialized the same regardless of load_from_checkpoint's value
+# intermediate values and gradients in encoder layers need cached so they can be acessed later in backpropagation and optimization.
 cache = [{} for _ in range(num_layers)]
 layer_grads = [{} for _ in range(num_layers)]
 
@@ -223,7 +225,7 @@ data = unpickle("cifar-100-python/train")
 for epoch in range(initial_epoch, num_epochs):
     for i in range(initial_i, num_examples // batch_size):
         # get example
-        # label is an int, image is a numpy array of ints of shape 32, 32, 3
+        # label is an int, image is a numpy array of ints in shape: (rows, cols, color_dim)
         labels, images = get_batch(data, i, batch_size)
 
         # one hot encode labels, results in shape: (batch_size, num_classes)
@@ -249,10 +251,12 @@ for epoch in range(initial_epoch, num_epochs):
         # add position embeddings
         position_embeddings_out = cls_token_out + position_embeddings
 
+        # set encoder_input to position_embeddings_out so it can treated the same as the output of each layer that gets reprocessed as input
         encoder_input = position_embeddings_out
 
         # transformer encoder block starts here
         for j in range(num_layers):
+            # throughout the encoder layer all intermediate values will be cached for use in backpropagation later
             cache[j]["encoder_input"] = encoder_input
 
             # layernorm
@@ -299,6 +303,7 @@ for epoch in range(initial_epoch, num_epochs):
             attention_out = attention2.transpose(0, 2, 1, 3).reshape(batch_size, num_patches, embed_dim)
             cache[j]["attention_out"] = attention_out 
 
+            # matrix multiplication
             attention_out2 = attention_out @ layers[j]["linear_out"]
             cache[j]["attention_out2"] = attention_out2
 
@@ -312,7 +317,7 @@ for epoch in range(initial_epoch, num_epochs):
             layernorm2_out = layernorm(residual1, layers[j]["gamma2"], layers[j]["beta2"])
             cache[j]["layernorm2_out"] = layernorm2_out
 
-            # fist MLP, results in shape: (batch_size, num_patches, embed_dim)
+            # first MLP, results in shape: (batch_size, num_patches, embed_dim)
             linear2_out = layernorm2_out @ layers[j]["linear2"]
             bias2_out = linear2_out + layers[j]["bias2"]
             gelu1_out = gelu(bias2_out)
@@ -328,6 +333,7 @@ for epoch in range(initial_epoch, num_epochs):
             residual2 = residual1 + bias3_out
             cache[j]["residual2"] = residual2
 
+            # set encoder_input to what would be encoder output, residual2, so it can be reprocessed by next layer
             encoder_input = residual2
 
         # transformer block ends here, repeat N times using previous output as input
@@ -361,7 +367,6 @@ for epoch in range(initial_epoch, num_epochs):
         # backpropagation
 
         # cross entropy gradient
-        # derivation in notebook
         dlogits = (softmax(logits) - targets) / batch_size 
 
         # final MLP gradient
@@ -369,12 +374,10 @@ for epoch in range(initial_epoch, num_epochs):
         dbias5_out[:, 0] = dlogits
 
         # matrix addition gradient
-        # derivation in notebook
         dlinear5_out = dbias5_out
         dbias5 = np.sum(dbias5_out, axis = 1)
 
         # matrix multiplication gradient
-        # derivation in notebook
         dbias4_out = dlinear5_out @ linear5.T
         dlinear5 = bias4_out.transpose(0, 2, 1) @ dlinear5_out
 
@@ -386,7 +389,7 @@ for epoch in range(initial_epoch, num_epochs):
         dresidual2 = dlinear4_out @ linear4.T
         dlinear4 = residual2.transpose(0, 2, 1) @ dlinear4_out
 
-        # NEW transformer block gradient
+        # transformer encoder layer gradient
         dencoder_input = dresidual2
         for j in reversed(range(num_layers)):
             dresidual1 = dencoder_input
@@ -413,7 +416,7 @@ for epoch in range(initial_epoch, num_epochs):
             dlinear2 = cache[j]["layernorm2_out"].transpose(0, 2, 1) @ dlinear2_out
 
             # layernorm gradient
-            temp_dresidual1, dgamma2, dbeta2 = LAYERNORM_BACKWARD(dlayernorm2_out, cache[j]["residual1"], layers[j]["gamma2"])
+            temp_dresidual1, dgamma2, dbeta2 = layernorm_backward(dlayernorm2_out, cache[j]["residual1"], layers[j]["gamma2"])
             dresidual1 += temp_dresidual1
 
             # residual connection gradient
@@ -431,7 +434,7 @@ for epoch in range(initial_epoch, num_epochs):
             dv = cache[j]["soft_attention"].transpose(0, 1, 3, 2) @ dattention2 # not what response has, but I think it's right
 
             # softmax gradient
-            dot = np.sum(dsoft_attention * cache[j]["soft_attention"], axis=-1, keepdims=True)
+            dot = np.sum(dsoft_attention * cache[j]["soft_attention"], axis = -1, keepdims = True)
             dscaled_attention = cache[j]["soft_attention"] * (dsoft_attention - dot)
 
             # gradient of scalar multiplication
@@ -455,14 +458,16 @@ for epoch in range(initial_epoch, num_epochs):
             dlayernorm1_out = dq @ layers[j]["linear_q"].T
             dlinear_q = cache[j]["layernorm1_out"].transpose(0, 2, 1) @ dq
 
+            # matrix multiplication gradient
             dlayernorm1_out += dk @ layers[j]["linear_k"].T
             dlinear_k = cache[j]["layernorm1_out"].transpose(0, 2, 1) @ dk
 
+            # matrix multiplication gradient
             dlayernorm1_out += dv @ layers[j]["linear_v"].T
             dlinear_v = cache[j]["layernorm1_out"].transpose(0, 2, 1) @ dv
 
             # layernorm gradient
-            temp_dencoder_input, dgamma1, dbeta1 = LAYERNORM_BACKWARD(dlayernorm1_out, cache[j]["encoder_input"], layers[j]["gamma1"])
+            temp_dencoder_input, dgamma1, dbeta1 = layernorm_backward(dlayernorm1_out, cache[j]["encoder_input"], layers[j]["gamma1"])
             dencoder_input = temp_dencoder_input + dresidual1
 
             # save gradients 
@@ -494,12 +499,12 @@ for epoch in range(initial_epoch, num_epochs):
         dbias1 = np.sum(dbias1_out, axis = 1)
 
         # matrix multiplication gradient
-        # info: only linear1 is required to calculate, as it's the final trainable parameter in the gradient chain.
+        # linear1 is the final trainable parameter in the gradient chain
         dlinear1 = patches.transpose(0, 2, 1) @ dlinear1_out 
         # end backpropagation
 
         # optimization using SGD
-        linear1 -= np.sum(dlinear1, axis = 0) * learning_rate # was np.mean(), probably shouldn't have been
+        linear1 -= np.sum(dlinear1, axis = 0) * learning_rate
         bias1 -=  np.sum(dbias1, axis = 0) * learning_rate
         position_embeddings -= np.sum(dposition_embeddings, axis = 0) * learning_rate
         cls_token -= np.sum(dcls_token, axis = 0) * learning_rate
@@ -520,8 +525,6 @@ for epoch in range(initial_epoch, num_epochs):
         bias4 -= np.sum(dbias4, axis = 0) * learning_rate
         linear5 -= np.sum(dlinear5, axis = 0) * learning_rate
         bias5 -= np.sum(dbias5, axis = 0) * learning_rate
-
-        # after 1 epoch, the model achieves approximately 92% accuracy on mnist, showing the model works.
     
         # after every 100 iterations, save weights, store weights, and store stats
         if i % 100 == 0:
@@ -543,5 +546,5 @@ for epoch in range(initial_epoch, num_epochs):
             with open(checkpoint_stats_path, "w") as f:
                 json.dump(training_stats, f)
 
-    # after epoch, set initial_i to 0 to train through full next epochs, regardless of initial_i in first epoch
+    # after epoch, set initial_i to 0 to train through next epochs full, regardless of initial_i in first epoch
     initial_i = 0
